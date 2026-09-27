@@ -1,6 +1,7 @@
 import json
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -53,7 +54,12 @@ def submit_bid(
         tech_material=data.tech_material,
     )
     db.add(bid)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        # 唯一约束兜底：并发重复提交只保留一份
+        db.rollback()
+        raise HTTPException(status_code=409, detail="已提交过投标文件")
 
     result = check_bid_document(db, section_id, bid)
     bid.compliance_json = json.dumps(result)
@@ -68,7 +74,7 @@ def submit_bid(
         db.commit()
     db.commit()
     db.refresh(bid)
-    add_audit(db, user.id, "SUBMIT_BID", f"标段 {section.code} 提交投标 {bid.company}")
+    add_audit(db, user.id, "SUBMIT_BID", f"标段 {section.code} 提交投标 {bid.company}", entity_type="bid_document", entity_id=bid.id)
     return {"id": bid.id, "compliance": result}
 
 

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
 
 from app.core.database import Base
 
@@ -9,6 +9,9 @@ class BidDocument(Base):
     """投标文件。"""
 
     __tablename__ = "bid_documents"
+    __table_args__ = (
+        UniqueConstraint("section_id", "bidder_id", name="uq_bid_section_bidder"),
+    )
 
     id = Column(Integer, primary_key=True)
     section_id = Column(Integer, ForeignKey("tender_sections.id"), nullable=False, index=True)

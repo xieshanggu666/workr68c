@@ -8,8 +8,7 @@ from app.core.deps import get_current_user, require_roles
 from app.models import Announcement, Project, TenderSection, TenderStatusLog, User
 from app.schemas import AnnouncementIn, ProjectIn, SectionIn, TransitionIn
 from app.services.audit_service import add_audit
-from app.services.escrow_service import return_section_deposits
-from app.services.status_service import transition
+from app.services.status_service import fail_section, transition
 
 router = APIRouter(prefix="/api", tags=["projects"])
 
@@ -40,7 +39,7 @@ def create_project(data: ProjectIn, db: Session = Depends(get_db), user: User = 
     db.add(project)
     db.commit()
     db.refresh(project)
-    add_audit(db, user.id, "CREATE_PROJECT", f"创建招标项目 {project.code} {project.name}")
+    add_audit(db, user.id, "CREATE_PROJECT", f"创建招标项目 {project.code} {project.name}", entity_type="project", entity_id=project.id)
     return _project_dict(project, 0)
 
 
@@ -79,7 +78,7 @@ def create_section(
     if project.status == "draft":
         project.status = "published"
         db.commit()
-    add_audit(db, user.id, "CREATE_SECTION", f"创建标段 {section.code} {section.name}")
+    add_audit(db, user.id, "CREATE_SECTION", f"创建标段 {section.code} {section.name}", entity_type="section", entity_id=section.id)
     return _section_dict(section)
 
 
@@ -101,11 +100,18 @@ def section_transition(
     section = db.get(TenderSection, section_id)
     if not section:
         raise HTTPException(status_code=404, detail="标段不存在")
-    if not transition(db, section, data.to_status, user.id, data.remark):
-        raise HTTPException(status_code=400, detail=f"不允许从 {section.status} 流转到 {data.to_status}")
     if data.to_status == "failed":
-        return_section_deposits(db, section.id, "标段流标，保证金退还")
-    add_audit(db, user.id, "SECTION_TRANSITION", f"标段 {section.code} {section.status}→{data.to_status}")
+        # 流标：状态流转 + 全部保证金退还 + 审计，单事务可重试
+        if not fail_section(db, section, user.id, data.remark or "标段流标"):
+            raise HTTPException(status_code=409, detail=f"不允许从 {section.status} 流转到 failed")
+        return _section_dict(section)
+    from_status = section.status
+    if not transition(db, section, data.to_status, user.id, data.remark):
+        raise HTTPException(status_code=409, detail=f"不允许从 {from_status} 流转到 {data.to_status}")
+    add_audit(
+        db, user.id, "SECTION_TRANSITION", f"标段 {section.code} {from_status}→{data.to_status}",
+        entity_type="section", entity_id=section.id,
+    )
     return _section_dict(section)
 
 

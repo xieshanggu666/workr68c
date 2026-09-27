@@ -156,8 +156,11 @@ def respond_clarification(
     try:
         item = submit_clarification(db, item, data.content)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    add_audit(db, user.id, "ABNORMAL_PRICE_RESPONSE", f"投标 {item.bid_document_id} 提交异常低价澄清")
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    add_audit(
+        db, user.id, "ABNORMAL_PRICE_RESPONSE", f"投标 {item.bid_document_id} 提交异常低价澄清",
+        entity_type="clarification", entity_id=item.id,
+    )
     return clarification_dict(item)
 
 
@@ -176,36 +179,44 @@ def review_abnormal_clarification(
         raise HTTPException(status_code=404, detail="标段不存在")
     expire_pending_clarifications(db, section.id)
     db.refresh(item)
-    if item.status == "excluded":
-        bids = db.query(BidDocument).filter(BidDocument.section_id == section.id).all()
-        result = finalize_lowest_price_evaluation(db, section, user, bids)
+    if item.status in {"accepted", "excluded"}:
+        # 澄清已有结论：动作不一致视为冲突，一致则幂等返回当前定标结果
+        if data.action != item.status:
+            raise HTTPException(status_code=409, detail=f"该澄清已处理为 {item.status}，不能重复审核")
+        result = finalize_lowest_price_evaluation(db, section, user)
         if result.get("failed"):
-            add_audit(db, user.id, "OPEN_EVALUATION", f"标段 {section.code} 异常低价逾期排除后流标")
+            add_audit(
+                db, user.id, "OPEN_EVALUATION", f"标段 {section.code} 异常低价逾期排除后流标",
+                entity_type="section", entity_id=section.id,
+            )
         return result
     try:
         result = review_clarification(db, section, item, data.action, user, data.remark)
-        if result.get("needs_clarification"):
-            rule = _get_rule(db, section.id)
-            bids = db.query(BidDocument).filter(BidDocument.section_id == section.id).all()
-            result = prepare_lowest_price_evaluation(db, section, rule, bids)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     add_audit(
         db,
         user.id,
         "ABNORMAL_PRICE_REVIEW",
         f"投标 {item.bid_document_id} 异常低价澄清处理为 {data.action}",
+        entity_type="clarification",
+        entity_id=item.id,
     )
     return result
 
 
 @router.post("/sections/{section_id}/evaluation/open")
 def open_evaluation(section_id: int, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "operator"))):
+    """开标：整个流程（状态流转、算分、澄清、定标、退款、公示）单事务提交。
+
+    已定标重复开标返回 409；评标中重复开标按当前状态幂等推进；
+    并发开标由 awarded 状态流转（CAS）收敛为一次定标。
+    """
     section = db.get(TenderSection, section_id)
     if not section:
         raise HTTPException(status_code=404, detail="标段不存在")
     if section.status == "awarded":
-        raise HTTPException(status_code=400, detail="标段已定标，不能重复开标")
+        raise HTTPException(status_code=409, detail="标段已定标，不能重复开标")
 
     rule = _get_rule(db, section_id)
     bids = db.query(BidDocument).filter(BidDocument.section_id == section_id).all()
@@ -216,28 +227,51 @@ def open_evaluation(section_id: int, db: Session = Depends(get_db), user: User =
         raise HTTPException(status_code=400, detail="当前标段状态不能开标")
 
     if section.status == "bidding":
-        if not transition(db, section, "evaluating", user.id, "开标进入评标"):
-            raise HTTPException(status_code=400, detail="当前标段状态不能开标")
+        if not transition(db, section, "evaluating", user.id, "开标进入评标", commit=False):
+            db.rollback()
+            raise HTTPException(status_code=409, detail="标段状态被并发修改，请重试")
 
     if section.method == "lowest_price":
-        result = prepare_lowest_price_evaluation(db, section, rule, bids)
+        result = prepare_lowest_price_evaluation(db, section, rule, bids, commit=False)
         if result["needs_clarification"]:
-            add_audit(db, user.id, "OPEN_EVALUATION", f"标段 {section.code} 开标，存在异常低价待澄清")
+            db.commit()
+            add_audit(
+                db, user.id, "OPEN_EVALUATION", f"标段 {section.code} 开标，存在异常低价待澄清",
+                entity_type="section", entity_id=section.id,
+            )
             return result
-        result = finalize_lowest_price_evaluation(db, section, user, bids)
+        try:
+            result = finalize_lowest_price_evaluation(db, section, user, bids, commit=False)
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        db.commit()
         if result.get("failed"):
-            add_audit(db, user.id, "OPEN_EVALUATION", f"标段 {section.code} 异常低价排除后流标")
-            return result
-        add_audit(db, user.id, "OPEN_EVALUATION", f"标段 {section.code} 开标")
+            add_audit(
+                db, user.id, "OPEN_EVALUATION", f"标段 {section.code} 异常低价排除后流标",
+                entity_type="section", entity_id=section.id,
+            )
+        else:
+            add_audit(
+                db, user.id, "OPEN_EVALUATION", f"标段 {section.code} 开标",
+                entity_type="section", entity_id=section.id,
+            )
         return result
 
     ranked = evaluate_section(db, section_id, rule, bids)
     if not ranked:
+        db.rollback()
         raise HTTPException(status_code=400, detail="无有效评分结果，无法定标")
     winner_bid = db.get(BidDocument, ranked[0]["bid_document_id"])
     existing = db.query(Winner).filter(Winner.section_id == section_id, Winner.status != "cancelled").first()
     if existing:
-        raise HTTPException(status_code=400, detail="标段已存在中标记录")
+        db.rollback()
+        raise HTTPException(status_code=409, detail="标段已存在中标记录")
+
+    # 并发闸门：awarded 状态流转（CAS）仅允许一个请求进入定标
+    if not transition(db, section, "awarded", user.id, "开标并产生中标候选人", commit=False):
+        db.rollback()
+        raise HTTPException(status_code=409, detail="标段状态流转失败（可能已被并发定标），请刷新后重试")
 
     winner = Winner(
         section_id=section_id,
@@ -247,28 +281,41 @@ def open_evaluation(section_id: int, db: Session = Depends(get_db), user: User =
         status="pending",
     )
     db.add(winner)
+    db.flush()
     winner_bid.status = "won"
     for bid in qualified:
         if bid.id != winner_bid.id:
             bid.status = "lost"
-            return_bid_deposit(db, section_id, bid.id, "未中标保证金退还")
+            return_bid_deposit(
+                db,
+                section_id,
+                bid.id,
+                "未中标保证金退还",
+                key_prefix=f"return:bid:{bid.id}:not_won",
+                ref_type="not_won",
+                ref_id=section_id,
+                operator_id=user.id,
+                commit=False,
+            )
+    start_publicity(db, section, winner, commit=False)
     db.commit()
     db.refresh(winner)
-    start_publicity(db, section, winner)
-
-    if not transition(db, section, "awarded", user.id, "开标并产生中标候选人"):
-        raise HTTPException(status_code=400, detail="标段状态流转失败")
-    add_audit(db, user.id, "OPEN_EVALUATION", f"标段 {section.code} 开标")
+    add_audit(
+        db, user.id, "OPEN_EVALUATION", f"标段 {section.code} 开标",
+        entity_type="section", entity_id=section.id,
+    )
     return {
         "ranked": ranked,
         "abnormal_prices": [],
         "clarifications": [],
         "active_clarifications": [],
         "needs_clarification": False,
+        "section_status": section.status,
         "winner_id": winner.id,
         "winner_bid_id": winner_bid.id,
         "winner_company": winner_bid.company,
         "winner_price": float(winner_bid.price),
         "publish_end": winner.publish_end,
         "awarded": True,
+        "failed": False,
     }
