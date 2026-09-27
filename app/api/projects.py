@@ -101,11 +101,17 @@ def section_transition(
     section = db.get(TenderSection, section_id)
     if not section:
         raise HTTPException(status_code=404, detail="标段不存在")
+    # 流标：状态流转与保证金退还在同一事务提交；已处于 failed 时按重试语义补齐退款
+    if data.to_status == "failed":
+        if not transition(db, section, "failed", user.id, data.remark, commit=False):
+            raise HTTPException(status_code=400, detail=f"不允许从 {section.status} 流转到 {data.to_status}")
+        return_section_deposits(db, section.id, "标段流标，保证金退还", operator_id=user.id, commit=False)
+        add_audit(db, user.id, "SECTION_TRANSITION", f"标段 {section.code} 流转为流标并退还保证金", commit=False)
+        db.commit()
+        return _section_dict(section)
     if not transition(db, section, data.to_status, user.id, data.remark):
         raise HTTPException(status_code=400, detail=f"不允许从 {section.status} 流转到 {data.to_status}")
-    if data.to_status == "failed":
-        return_section_deposits(db, section.id, "标段流标，保证金退还")
-    add_audit(db, user.id, "SECTION_TRANSITION", f"标段 {section.code} {section.status}→{data.to_status}")
+    add_audit(db, user.id, "SECTION_TRANSITION", f"标段 {section.code} 流转为 {data.to_status}")
     return _section_dict(section)
 
 

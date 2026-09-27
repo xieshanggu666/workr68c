@@ -24,8 +24,8 @@ const EscrowView = {
       <p v-if="!accounts.length" class="muted">暂无保证金账户</p>
       <div v-if="txs.length" class="mt">
         <b>账户 #{{ currentAccount }} 流水：</b>
-        <table class="mt"><thead><tr><th>类型</th><th>金额</th><th>余额</th><th>说明</th><th>时间</th></tr></thead>
-        <tbody><tr v-for="(t, i) in txs" :key="i"><td>{{ t.tx_type }}</td><td>¥{{ t.amount }}</td><td>¥{{ t.balance_after }}</td><td>{{ t.remark }}</td><td>{{ fmtDate(t.created_at) }}</td></tr></tbody></table>
+        <table class="mt"><thead><tr><th>类型</th><th>金额</th><th>余额</th><th>状态迁移</th><th>业务来源</th><th>说明</th><th>幂等键</th><th>时间</th></tr></thead>
+        <tbody><tr v-for="(t, i) in txs" :key="i"><td>{{ txTypeLabel(t.tx_type) }}</td><td>¥{{ t.amount }}</td><td>¥{{ t.balance_after }}</td><td>{{ t.from_status }}→{{ t.to_status }}</td><td>{{ bizLabel(t) }}</td><td>{{ t.remark }}</td><td class="muted" style="font-size:12px">{{ t.idempotency_key || '-' }}</td><td>{{ fmtDate(t.created_at) }}</td></tr></tbody></table>
       </div>
     </div>
   </div>`,
@@ -41,6 +41,11 @@ const EscrowView = {
     async forfeit(id) { try { await Api.post(`/api/escrow/${id}/forfeit`); await this.reload(); } catch (e) { alert(e.message); } },
     async showTx(id) { this.currentAccount = id; this.txs = await Api.get(`/api/escrow/${id}/transactions`); },
     async reload() { this.accounts = await Api.get(`/api/sections/${this.sectionId}/escrow`); },
+    txTypeLabel(t) { return { deposit: "缴纳", return: "退还", forfeit: "没收", confirm: "中标确认" }[t] || t; },
+    bizLabel(t) {
+      const m = { manual: "手工操作", clarification_excluded: "澄清不成立", clarification_expired: "澄清逾期", section_failed: "标段流标", bid_lost: "未中标", winner_confirmed: "中标确认" };
+      return m[t.biz_type] ? m[t.biz_type] + (t.biz_id ? ` (${t.biz_id})` : "") : (t.biz_type || "-");
+    },
     fmt(n) { return Number(n || 0).toLocaleString("zh-CN", { minimumFractionDigits: 2 }); },
     fmtDate(d) { return d ? String(d).replace("T", " ").slice(0, 16) : "-"; },
   },

@@ -32,7 +32,7 @@ def confirm_winner(winner_id: int, db: Session = Depends(get_db), user: User = D
     winner = db.get(Winner, winner_id)
     if not winner:
         return {"ok": False, "message": "中标记录不存在"}
-    ok = confirm_expired_publicity(db, winner)
+    ok = confirm_expired_publicity(db, winner, operator_id=user.id)
     if not ok:
         return {"ok": False, "message": "公示期尚未结束，暂不能确认中标"}
     return {"ok": True, "status": winner.status}

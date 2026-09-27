@@ -239,6 +239,7 @@ def open_evaluation(section_id: int, db: Session = Depends(get_db), user: User =
     if existing:
         raise HTTPException(status_code=400, detail="标段已存在中标记录")
 
+    # 定标全流程单事务：中标记录 + 投标状态 + 未中标退款 + 公示 + 标段流转 + 审计
     winner = Winner(
         section_id=section_id,
         bid_document_id=winner_bid.id,
@@ -247,18 +248,28 @@ def open_evaluation(section_id: int, db: Session = Depends(get_db), user: User =
         status="pending",
     )
     db.add(winner)
+    db.flush()
     winner_bid.status = "won"
     for bid in qualified:
         if bid.id != winner_bid.id:
             bid.status = "lost"
-            return_bid_deposit(db, section_id, bid.id, "未中标保证金退还")
+            return_bid_deposit(
+                db,
+                section_id,
+                bid.id,
+                "未中标保证金退还",
+                operator_id=user.id,
+                biz_type="bid_lost",
+                biz_id=f"bid:{bid.id}",
+                commit=False,
+            )
+    start_publicity(db, section, winner, commit=False)
+    if not transition(db, section, "awarded", user.id, "开标并产生中标候选人", commit=False):
+        db.rollback()
+        raise HTTPException(status_code=400, detail="标段状态流转失败")
+    add_audit(db, user.id, "OPEN_EVALUATION", f"标段 {section.code} 开标", commit=False)
     db.commit()
     db.refresh(winner)
-    start_publicity(db, section, winner)
-
-    if not transition(db, section, "awarded", user.id, "开标并产生中标候选人"):
-        raise HTTPException(status_code=400, detail="标段状态流转失败")
-    add_audit(db, user.id, "OPEN_EVALUATION", f"标段 {section.code} 开标")
     return {
         "ranked": ranked,
         "abnormal_prices": [],

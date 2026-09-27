@@ -109,7 +109,10 @@ def _find_abnormal_low_bids(rule: EvaluationRule, bids: list[BidDocument]) -> li
 
 
 def expire_pending_clarifications(db, section_id: int) -> list[AbnormalPriceClarification]:
-    """澄清期限届满仍未说明的，视为不能合理说明并排除。"""
+    """澄清期限届满仍未说明的，视为不能合理说明并排除。
+
+    排除与保证金退还在同一事务提交；退款按澄清记录幂等，重复执行不重复退款。
+    """
     now = datetime.utcnow()
     expired = (
         db.query(AbnormalPriceClarification)
@@ -127,7 +130,15 @@ def expire_pending_clarifications(db, section_id: int) -> list[AbnormalPriceClar
         bid = db.get(BidDocument, item.bid_document_id)
         if bid:
             bid.status = "abn_excluded"
-        return_bid_deposit(db, section_id, item.bid_document_id, "异常低价未在期限内澄清，保证金退还")
+        return_bid_deposit(
+            db,
+            section_id,
+            item.bid_document_id,
+            "异常低价未在期限内澄清，保证金退还",
+            biz_type="clarification_expired",
+            biz_id=f"clarification:{item.id}",
+            commit=False,
+        )
     if expired:
         db.commit()
     return expired
@@ -191,20 +202,43 @@ def prepare_lowest_price_evaluation(db, section, rule: EvaluationRule, bids: lis
         "active_abnormal_prices": [float(item.suspected_price) for item in active],
         "needs_clarification": bool(active),
         "section_status": section.status,
+        "winner_bid_id": None,
+        "winner_company": None,
+        "winner_price": None,
+        "publish_end": None,
+        "awarded": False,
         "candidate_bids": candidates,
     }
 
 
-def _cancel_pending_winners(db, section_id: int) -> None:
-    winners = db.query(Winner).filter(Winner.section_id == section_id, Winner.status == "pending").all()
-    for winner in winners:
-        winner.status = "cancelled"
-    if winners:
-        db.commit()
+def _get_or_create_winner(db, section_id: int, winner_bid: BidDocument) -> Winner:
+    """获取或创建标段中标记录：重复定标返回既有记录，不产生重复中标。"""
+    winner = (
+        db.query(Winner)
+        .filter(Winner.section_id == section_id, Winner.status != "cancelled")
+        .order_by(Winner.created_at.desc())
+        .first()
+    )
+    if winner is not None:
+        return winner
+    winner = Winner(
+        section_id=section_id,
+        bid_document_id=winner_bid.id,
+        bidder_id=winner_bid.bidder_id,
+        win_price=float(winner_bid.price),
+        status="pending",
+    )
+    db.add(winner)
+    db.flush()
+    return winner
 
 
 def finalize_lowest_price_evaluation(db, section, user, bids: list[BidDocument] | None = None) -> dict:
-    """全部异常低价处理完成后才允许最低价排名定标和公示。"""
+    """全部异常低价处理完成后才允许最低价排名定标和公示。
+
+    定标（中标记录、投标状态、未中标退款、公示、标段流转）在同一事务提交；
+    退款按业务来源幂等，整个函数可安全重试。
+    """
     if bids is None:
         bids = db.query(BidDocument).filter(BidDocument.section_id == section.id).all()
     expire_pending_clarifications(db, section.id)
@@ -237,10 +271,19 @@ def finalize_lowest_price_evaluation(db, section, user, bids: list[BidDocument] 
     ]
     ranked = _rank_lowest_candidates(candidates)
     if not candidates:
-        _cancel_pending_winners(db, section.id)
         for bid in bids:
-            return_bid_deposit(db, section.id, bid.id, "有效投标不足导致流标，保证金退还")
-        transition(db, section, "failed", user.id, "异常低价排除后无有效投标，标段流标")
+            return_bid_deposit(
+                db,
+                section.id,
+                bid.id,
+                "有效投标不足导致流标，保证金退还",
+                operator_id=user.id,
+                biz_type="section_failed",
+                biz_id=f"section:{section.id}",
+                commit=False,
+            )
+        transition(db, section, "failed", user.id, "异常低价排除后无有效投标，标段流标", commit=False)
+        db.commit()
         return {
             "ranked": ranked,
             "clarifications": [clarification_dict(item) for item in clarifications],
@@ -258,27 +301,27 @@ def finalize_lowest_price_evaluation(db, section, user, bids: list[BidDocument] 
         }
 
     winner_bid = min(candidates, key=lambda bid: float(bid.price))
-    _cancel_pending_winners(db, section.id)
-    winner = Winner(
-        section_id=section.id,
-        bid_document_id=winner_bid.id,
-        bidder_id=winner_bid.bidder_id,
-        win_price=float(winner_bid.price),
-        status="pending",
-    )
-    db.add(winner)
-    db.commit()
-    db.refresh(winner)
+    winner = _get_or_create_winner(db, section.id, winner_bid)
 
     winner_bid.status = "won"
     for bid in candidates:
         if bid.id != winner_bid.id:
             bid.status = "lost"
-            return_bid_deposit(db, section.id, bid.id, "未中标保证金退还")
-    db.commit()
+            return_bid_deposit(
+                db,
+                section.id,
+                bid.id,
+                "未中标保证金退还",
+                operator_id=user.id,
+                biz_type="bid_lost",
+                biz_id=f"bid:{bid.id}",
+                commit=False,
+            )
 
-    start_publicity(db, section, winner)
-    transition(db, section, "awarded", user.id, "异常低价澄清完成，开标并产生中标候选人")
+    start_publicity(db, section, winner, commit=False)
+    transition(db, section, "awarded", user.id, "异常低价澄清完成，开标并产生中标候选人", commit=False)
+    db.commit()
+    db.refresh(winner)
     return {
         "ranked": _rank_lowest_candidates(candidates),
         "clarifications": [clarification_dict(item) for item in clarifications],
@@ -328,7 +371,16 @@ def review_clarification(db, section, item: AbnormalPriceClarification, action: 
         item.status = "excluded"
         if bid:
             bid.status = "abn_excluded"
-        return_bid_deposit(db, section.id, item.bid_document_id, "异常低价澄清不成立，保证金退还")
+        return_bid_deposit(
+            db,
+            section.id,
+            item.bid_document_id,
+            "异常低价澄清不成立，保证金退还",
+            operator_id=reviewer.id,
+            biz_type="clarification_excluded",
+            biz_id=f"clarification:{item.id}",
+            commit=False,
+        )
     db.commit()
     return finalize_lowest_price_evaluation(db, section, reviewer)
 

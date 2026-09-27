@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api import auth, bids, dashboard, escrow, evaluation, projects, winner
-from app.core.database import Base, engine
+from app.core.database import Base, engine, run_migrations
 import app.models  # noqa: F401  确保所有模型已注册
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -26,6 +26,7 @@ app.add_middleware(
 @app.on_event("startup")
 def ensure_tables():
     Base.metadata.create_all(bind=engine)
+    run_migrations()
 
 
 for router in (auth.router, projects.router, bids.router, evaluation.router, escrow.router, winner.router, dashboard.router):
